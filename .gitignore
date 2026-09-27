@@ -1,0 +1,24 @@
+# 环境与密钥
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地凭证/配置
+credentials.json
+secrets.json
+
+# 数据文件（行情数据可自行通过 fetch_stock_history.py 重新获取）
+*.xlsx
+*.csv
+
+# 临时图表/运行时产物
+chatbi_images/
+image_show/
+workspace/
+
