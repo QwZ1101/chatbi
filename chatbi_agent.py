@@ -9,6 +9,7 @@
 
 工具：
     exc_sql           执行 SQL 查询 stock_daily 并自动可视化（历史日线行情）
+    stock_analysis    固定口径的区间涨跌幅、月末收盘价及上涨日占比
     tavily_search     Tavily 联网搜索（新闻、公告、宏观、研报观点等库外信息）
     arima_stock       ARIMA(5,1,5) 预测未来 n 个交易日收盘价（取近一年数据建模）
     boll_detection    布林带(20日, 2σ)超买超卖检测（默认过去一年，可自定义区间）
@@ -44,6 +45,7 @@ import hashlib
 import tempfile
 import warnings
 import datetime
+from html import escape
 
 import pandas as pd
 import numpy as np
@@ -51,10 +53,18 @@ import requests
 import matplotlib
 matplotlib.use('Agg')  # 无界面环境下渲染到内存/文件
 import matplotlib.pyplot as plt
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from db_access import DB_CONFIG, db_url, read_dataframe
+from sql_guard import validate_sql, POLICY_VERSION
+from request_cache import current_cache
+from stock_analysis import analyze_stocks
+from forecast_policy import forecast_origin
+import uuid
 
 import dashscope
-from qwen_agent.agents import Assistant
+from traced_assistant import TracedAssistant
+from native_tool_model import NativeToolModel
+from trace_logging import emit, record_error, record_tool_exceptions
 from qwen_agent.tools.base import BaseTool, register_tool
 
 try:
@@ -68,23 +78,18 @@ plt.rcParams['axes.unicode_minus'] = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 图片存到纯 ASCII 的系统临时目录，避免工程路径含中文/全角冒号导致 /file= URL 加载失败
-IMAGE_DIR = os.path.join(tempfile.gettempdir(), 'chatbi_images')
-
-# ---------- 数据库连接配置（环境变量优先，回落到本地开发默认值）----------
-DB_CONFIG = {
-    'host': os.getenv('MYSQL_HOST', 'localhost'),
-    'port': os.getenv('MYSQL_PORT', '3306'),
-    'user': os.getenv('MYSQL_USER', 'root'),
-    'password': os.getenv('MYSQL_PASSWORD', '123456'),
-    'db': os.getenv('MYSQL_DB', 'chatbi'),
-}
+IMAGE_BASE = os.path.join(tempfile.gettempdir(), 'chatbi_images')
+IMAGE_DIR = os.path.join(IMAGE_BASE, 'instance_' + uuid.uuid4().hex)
 
 
-def db_url() -> str:
-    cfg = DB_CONFIG
-    return (f'mysql+mysqlconnector://{cfg["user"]}:{cfg["password"]}'
-            f'@{cfg["host"]}:{cfg["port"]}/{cfg["db"]}?charset=utf8mb4')
+def image_path(prefix='chart'):
+    # A request retains its images for conversation history; other requests use different folders.
+    cache = current_cache()
+    folder = os.path.join(IMAGE_DIR, cache.id if cache else 'direct')
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, prefix + '_' + uuid.uuid4().hex + '.png')
 
+# 数据库连接统一由 db_access 管理，只接受专用只读账号。
 
 # ---------- 配置 DashScope ----------
 dashscope.api_key = os.getenv('DASHSCOPE_API_KEY', '')
@@ -129,22 +134,23 @@ CREATE TABLE stock_daily (
 
 覆盖的股票：
 贵州茅台(600519.SH)、五粮液(000858.SZ)、国泰君安(601211.SH)、中芯国际(688981.SH)
-数据区间：2025-01-01 至今。
+实际数据范围以查询结果为准，不保证行情更新到今天。
 
 编写 SQL 须知：
-1. 只查询 stock_daily 表，只允许 SELECT，不要生成增删改语句。
+1. 只查询 stock_daily 单表，只允许单条 SELECT，不要生成增删改语句。禁止注释、CTE、子查询、UNION、JOIN、锁和文件操作；最多返回 5000 行。
 2. `change` 是 MySQL 保留字，出现时务必写成反引号 `change`。
 3. 日期过滤用 trade_date，格式 'YYYY-MM-DD'，如 WHERE trade_date BETWEEN '2025-01-01' AND '2025-03-31'。
 4. 按月份聚合可用 DATE_FORMAT(trade_date, '%Y-%m')；按周可用 YEARWEEK(trade_date, 1)。
 5. 常用指标：涨跌幅 pct_chg、收盘价 close、成交量 vol、成交额 amount。
    示例：区间最高收盘价 MAX(close)、平均涨跌幅 AVG(pct_chg)、按股票分组 GROUP BY stock_name。
 
-你可以使用两个工具，按问题性质选择，必要时可以协同使用：
+按问题性质选择以下工具，必要时可以协同使用：
 
 工具一：exc_sql（本地行情数据）
-- 数据全部来自 stock_daily 表，覆盖 2025-01-01 至今上述四只股票的历史日线。
+- 数据全部来自 stock_daily 表；具体覆盖区间以库内实际记录为准。
 - 凡是让你「查询/统计/对比/排行/走势/涨跌幅/成交量/成交额/收盘价」等
-  可由本地行情表直接算出的量化问题，一律用 exc_sql 跑 SQL，不要联网搜索。
+  可由本地行情表直接算出的普通量化问题，用 exc_sql 跑 SQL，不要联网搜索。
+- 区间首末涨跌幅、月末收盘价、上涨/下跌天数优先用 stock_analysis，不要编写被禁止的窗口函数、子查询或 CTE。
 - 外部网站给出的行情数字可能与库内口径不一致，行情数据以 exc_sql 查询结果为准。
 
 工具二：tavily_search（联网搜索）
@@ -161,7 +167,7 @@ CREATE TABLE stock_daily (
 - 入参 ts_code 必填（把股票名称换算成代码：贵州茅台 600519.SH、五粮液 000858.SZ、
   国泰君安 601211.SH、中芯国际 688981.SH），n 为预测交易日天数（用户未说时默认 5）。
 - 工具内部会自动取近一年收盘价并用 ARIMA(5,1,5) 建模，返回内容同样包含
-  HTML 表格和一张历史+预测图，必须与 exc_sql 一样原样完整输出。
+  HTML 表格和一张历史+预测图，由应用直接展示。
 - 向用户解读时要说明这是基于历史价格的统计预测、不确定性高，不构成投资建议。
 
 工具四：boll_detection（布林带超买超卖检测）
@@ -169,7 +175,7 @@ CREATE TABLE stock_daily (
 - 入参 ts_code 必填（股票名称换算同工具三）；start_date/end_date 选填（YYYY-MM-DD），
   用户没给时间范围时不传这两个参数（默认检测过去一年）；用户指定了区间就传入对应日期。
 - 工具内部自动从 MySQL 取数并计算 20 日均线 ± 2σ 布林带，返回超买超卖日期表格和
-  布林带走势图，必须与 exc_sql 一样原样完整输出 HTML 表格和图片 markdown。
+  布林带走势图，由应用直接展示。
 - 解读时说明：超买/超卖仅表示价格相对近期 20 日波动区间的统计偏离，不构成投资建议。
 
 工具五：prophet_analysis（Prophet 周期性分析）
@@ -177,20 +183,55 @@ CREATE TABLE stock_daily (
 - 入参 ts_code 必填（股票名称换算同工具三）；start_date/end_date 选填（YYYY-MM-DD），
   用户没给时间范围时不传这两个参数（默认过去一年）；用户指定了区间就传入对应日期。
 - 工具内部使用 Prophet 对历史收盘价做时间序列分解，输出长期趋势(trend)、周内效应(weekly)、
-  年内季节效应(yearly) 三个分量的摘要表格和分量图，必须与 exc_sql 一样原样完整输出。
+  年内季节效应(yearly) 三个分量的摘要表格和分量图，由应用直接展示。
 - 解读时说明：三个分量是模型对历史数据的统计分解结果，不完全代表真实因果，不构成投资建议。
 
+工具六：stock_analysis（固定口径的历史区间分析）
+- 区间首末收盘价涨跌幅用 mode=interval_return；每月末条收盘价用 mode=monthly_close；上涨/下跌/平盘天数和上涨日占比用 mode=daily_stats。
+- ts_codes 为 1～4 个完整股票代码的数组，start_date/end_date 必填 YYYY-MM-DD；时间范围不清楚时先澄清。
+- 工具通过参数化只读查询取数，再按真实交易日期计算。不得用 MAX(close) 代替月末收盘价，不得把日涨跌幅相加作为区间涨跌幅。
+- 应用展示工具返回的实际取值日期和缺失数据说明；仅一条观测时不能声称区间涨跌幅为 0。
+
 输出要求：
-- exc_sql、arima_stock、boll_detection、prophet_analysis 工具都会返回一个 HTML 表格（<table>...</table>）和一张图片的 markdown。你必须把工具返回的 HTML 表格和图片 markdown 原样、完整地输出，不要改写成文字描述，不要用 ``` 代码块包裹（一旦包进代码块，表格就无法渲染成样式），也不要省略图片，这样用户才能直接看到表格和图片。图片的 markdown 语法 ![文字](/file=路径) 必须完整地写在一行之内，中间绝对不能换行或插入空格，否则前端无法渲染成图片。
-- 你可以在表格前后补充自然语言分析；若同时用到 tavily_search，请把搜索到的外部信息
-  融入分析，并在相关结论后用 [来源n] 标注引用，文末列出对应链接，但表格的 HTML 和图片链接必须保持原样。
-- 纯联网搜索类问题（无表格）时，用分点的中文自然语言总结答案并附来源链接即可。
-- 一旦某个工具返回了结果，你必须立即据此给出最终答案，不要用相同参数重复调用同一个工具。
-- 所有工具的调用参数必须写成单行紧凑 JSON，例如 {"ts_code": "600519.SH"}，禁止把参数拆成多行或加缩进。多行 JSON 会导致函数调用解析失败，系统会反复重试并把 <tool_call> 原文暴露给用户。
+- 所有股票数值、预测及图表必须来自实际工具调用；禁止模拟返回、编造文件路径或把工具协议作为普通文本输出。
+- 应用直接展示工具返回的表格、图片、统计说明及搜索来源。不要在最终回复中复制或改写这些数据；最终回复只需简短说明执行状态。
+- 工具返回失败、数据过期或没有数据时，不得宣称已成功完成分析。需要更多步骤时可以选择其他工具；不得用相同参数重复调用已完成的工具。
+- 通过 API 原生 tool_calls 发出调用，arguments 必须是合法 JSON 对象；不要在 content 中输出调用代码。
 """
 
+@register_tool('stock_analysis')
+class StockAnalysisTool(BaseTool):
+    description = '计算历史区间涨跌幅、每月最后一条收盘价、上涨下跌天数；无需生成复杂 SQL'
+    parameters = [
+        {'name': 'mode', 'type': 'string', 'enum': ['interval_return', 'monthly_close', 'daily_stats'],
+         'description': '分析口径', 'required': True},
+        {'name': 'ts_codes', 'type': 'array', 'items': {'type': 'string'},
+         'description': '1～4 个完整股票代码，如 ["600519.SH","000858.SZ"]', 'required': True},
+        {'name': 'start_date', 'type': 'string', 'description': '开始日期 YYYY-MM-DD', 'required': True},
+        {'name': 'end_date', 'type': 'string', 'description': '结束日期 YYYY-MM-DD', 'required': True},
+    ]
+
+    @record_tool_exceptions
+    def call(self, params: str, **kwargs) -> str:
+        args = json.loads(params) if isinstance(params, str) else params
+        try:
+            result = analyze_stocks(args)
+            output = escape(result.note)
+            if result.table.empty:
+                return output
+            output += '\n\n' + result.table.to_html(index=False, border=0, justify='center', na_rep='不可计算')
+            os.makedirs(IMAGE_DIR, exist_ok=True)
+            path = image_path()
+            if generate_chart_png(result.chart, path):
+                output += '\n\n![区间分析图](/file=' + os.path.abspath(path).replace('\\', '/') + ')'
+            return output
+        except Exception as error:
+            record_error(error, handled=True)
+            return '区间分析失败：' + escape(str(error))
+
+
 # ---------- exc_sql 工具实现 ----------
-_sql_cache = {}  # 防重复调用缓存: sql -> (timestamp, result)
+# 缓存仅存在于一次 Agent.run 请求内，不跨用户或会话共享。
 
 
 @register_tool('exc_sql')
@@ -204,43 +245,46 @@ class ExcSQLTool(BaseTool):
         'required': True,
     }]
 
+    @record_tool_exceptions
     def call(self, params: str, **kwargs) -> str:
         args = json.loads(params) if isinstance(params, str) else params
         sql_input = args['sql_input']
-        sql_key = hashlib.md5(sql_input.encode()).hexdigest()
-
-        # 防重复: 5 秒内相同 SQL 直接返回缓存
-        now = time.time()
-        cache_entry = _sql_cache.get(sql_key)
-        if cache_entry and (now - cache_entry[0]) < 5:
-            return cache_entry[1]
-
         try:
-            engine = create_engine(db_url(),
-                                   connect_args={'connect_timeout': 10},
-                                   pool_size=5, max_overflow=10)
-            df = pd.read_sql(sql_input, engine)
+            sql_input = validate_sql(sql_input)
+            cache = current_cache()
+            sql_key = (POLICY_VERSION, DB_CONFIG['host'], DB_CONFIG['port'], DB_CONFIG['db'], DB_CONFIG['user'], sql_input)
+            cache_entry = cache.get(sql_key) if cache else None
+            emit('cache_policy', scope='request', request_cache_id=cache.id if cache else None, ttl_seconds=5)
+            emit('cache_lookup', tool='exc_sql', hit=cache_entry is not None, enabled=cache is not None)
+            if cache_entry is not None:
+                return cache_entry
+            df = read_dataframe(sql_input)
             if df.empty:
                 return '查询执行成功，但没有返回任何数据。请检查查询条件（如日期范围、股票代码）。'
 
             # 用 HTML 表格而非 markdown 管道表：HTML 不依赖空行/换行，
             # 避免 Gradio 把未识别的表格当普通段落导致换行被折叠成一行
-            table_html = df.head(20).to_html(index=False, border=0, justify='center')
+            table_html = (f'查询返回 {len(df)} 行，表格显示前 {min(20, len(df))} 行。'
+                          + (' 已达到查询行数上限，结果可能截断，请缩小范围。' if len(df) >= 5000 else '')
+                          + '\n' + df.head(20).to_html(index=False, border=0, justify='center'))
+            if len(df) > 500:
+                table_html += '\n图表最多等距选取 500 条记录展示，不改变表格数据或查询计算结果。'
 
             # 生成图表并保存到本地，通过 Gradio /file= 暴露
             # （会话期间保留所有图以便翻阅历史，关闭界面时由 cleanup_images 统一清理）
             os.makedirs(IMAGE_DIR, exist_ok=True)
-            filename = f'chart_{int(time.time() * 1000)}.png'
-            save_path = os.path.join(IMAGE_DIR, filename)
+            save_path = image_path()
             chart_ok = generate_chart_png(df, save_path, sql_input)
 
             result = table_html
             if chart_ok:
                 img_local_path = os.path.abspath(save_path).replace('\\', '/')
                 result = f"{table_html}\n\n![查询结果图](/file={img_local_path})"
-            _sql_cache[sql_key] = (now, result)
+            if cache is not None:
+                cache.put(sql_key, result)
             return result
         except Exception as e:
+            record_error(e, handled=True)
             return f"SQL执行或可视化出错: {str(e)}"
 
 
@@ -260,6 +304,7 @@ class TavilySearchTool(BaseTool):
         'required': False,
     }]
 
+    @record_tool_exceptions
     def call(self, params: str, **kwargs) -> str:
         args = json.loads(params) if isinstance(params, str) else params
         query = args['query']
@@ -288,6 +333,7 @@ class TavilySearchTool(BaseTool):
                 timeout=30,
             )
         except requests.RequestException as e:
+            record_error(e, handled=True)
             return f'Tavily 搜索请求失败（网络异常）: {str(e)}'
 
         if resp.status_code != 200:
@@ -333,6 +379,7 @@ class ArimaStockTool(BaseTool):
         'required': False,
     }]
 
+    @record_tool_exceptions
     def call(self, params: str, **kwargs) -> str:
         args = json.loads(params) if isinstance(params, str) else params
         ts_code = str(args.get('ts_code', '')).strip()
@@ -354,11 +401,9 @@ class ArimaStockTool(BaseTool):
             ORDER BY trade_date ASC
         """)
         try:
-            engine = create_engine(db_url(),
-                                   connect_args={'connect_timeout': 10},
-                                   pool_size=5, max_overflow=10)
-            df = pd.read_sql(query, engine, params={'code': ts_code})
+            df = read_dataframe(query, params={'code': ts_code})
         except Exception as e:
+            record_error(e, handled=True)
             return f'读取历史行情失败：{str(e)}'
 
         if df.empty:
@@ -375,6 +420,14 @@ class ArimaStockTool(BaseTool):
         m = len(hist_y)
         last_close = float(hist_y[-1])
         last_date = df['trade_date'].iloc[-1]
+        today = datetime.date.today()
+        try:
+            anchor_date = forecast_origin(last_date.date(), today)
+            if (df['trade_date'].duplicated().any() or not np.isfinite(hist_y).all()
+                    or np.any(hist_y <= 0)):
+                raise ValueError('历史行情包含重复日期、无效价格或非正价格，暂停预测')
+        except ValueError as error:
+            return str(error)
 
         # 2. ARIMA(5,1,5) 建模并预测未来 n 步
         try:
@@ -393,14 +446,10 @@ class ArimaStockTool(BaseTool):
                 # statsmodels 不同版本 forecast 可能返回 ndarray 或 Series，统一规范成 ndarray
                 forecast = np.asarray(fit.forecast(steps=n)).ravel()
         except Exception as e:
+            record_error(e, handled=True)
             return f'ARIMA(5,1,5) 建模或预测失败：{str(e)}'
 
-        # 3. 推算未来 n 个 A 股交易日：剔除周末和法定节假日（如国庆、春节）
-        #    预测起点锚定「当前最新时间」而不是库内最后一条数据：
-        #    库内行情可能滞后（如今天是 9-24 但数据只到 9-21），若从库内末日期起算，
-        #    预测表里会混入已经过去的交易日，因此从 max(库内最后交易日, 今天) 的下一交易日起算。
-        today = datetime.date.today()
-        anchor_date = max(last_date.date(), today)
+        # Forecast step 1 always follows the last observation. Never relabel it as a later step.
         future_dates, cal_note = _next_trade_days(anchor_date, n)
         future_labels = [d.strftime('%Y-%m-%d') for d in future_dates]
         # 库内数据滞后于今天时显式提示，避免用户误以为训练数据包含最新行情
@@ -408,7 +457,7 @@ class ArimaStockTool(BaseTool):
         if last_date.date() < today:
             stale_note = (f'注意：库内行情数据截止 {last_date.strftime("%Y-%m-%d")}，'
                           f'早于今天 {today.strftime("%Y-%m-%d")}；模型基于截至该日的收盘价训练，'
-                          f'预测日历从当前日期之后起算。')
+                          f'预测从该观测日之后起算，可能包含已过去日期，不代表基于今日行情的实时预测。')
 
         pred_df = pd.DataFrame({
             '预测步(交易日)': list(range(1, n + 1)),
@@ -420,8 +469,7 @@ class ArimaStockTool(BaseTool):
 
         # 4. 绘制历史走势 + 预测（预测段与历史最后一个点相连，注意 x/y 长度对齐）
         os.makedirs(IMAGE_DIR, exist_ok=True)
-        safe_code = ts_code.replace('.', '_')
-        save_path = os.path.join(IMAGE_DIR, f'arima_{safe_code}_{int(time.time() * 1000)}.png')
+        save_path = image_path('arima')
         chart_ok = _plot_arima_forecast(
             hist_dates=hist_dates, hist_y=hist_y,
             future_labels=future_labels, forecast=forecast,
@@ -429,12 +477,12 @@ class ArimaStockTool(BaseTool):
 
         head = (f'ARIMA(5,1,5) 预测结果：{stock_name}({ts_code})<br>'
                 f'训练区间：{hist_dates[0]} ~ {hist_dates[-1]}，共 {m} 个交易日；'
-                f'最新收盘价：{last_close:.2f} 元；预测步数：未来 {n} 个交易日。')
+                f'库内末条收盘价：{last_close:.2f} 元；从末条观测后预测 {n} 步。')
         result = f'{head}\n\n{table_html}'
         if chart_ok:
             img_local_path = os.path.abspath(save_path).replace('\\', '/')
             result += f"\n\n![{stock_name}ARIMA预测图](/file={img_local_path})"
-        result += ('\n\n注：未来交易日已按 A 股交易日历剔除周末及法定节假日（由 chinese_calendar 本地日历推算）。')
+        result += ('\n\n注：日期由本地工作日/节假日规则估算，未核对交易所完整交易日历。')
         if stale_note:
             result += f'\n{stale_note}'
         if cal_note:
@@ -519,6 +567,7 @@ def _plot_arima_forecast(hist_dates, hist_y, future_labels, forecast, save_path,
         plt.close()
         return True
     except Exception as e:
+        record_error(e, handled=True)
         print(f'ARIMA 预测图生成失败（仅返回表格）: {e}')
         return False
 
@@ -546,6 +595,7 @@ class BollDetectionTool(BaseTool):
         'required': False,
     }]
 
+    @record_tool_exceptions
     def call(self, params: str, **kwargs) -> str:
         args = json.loads(params) if isinstance(params, str) else params
         ts_code = str(args.get('ts_code', '')).strip()
@@ -575,12 +625,10 @@ class BollDetectionTool(BaseTool):
             ORDER BY trade_date ASC
         """)
         try:
-            engine = create_engine(db_url(),
-                                   connect_args={'connect_timeout': 10},
-                                   pool_size=5, max_overflow=10)
-            df = pd.read_sql(query, engine,
+            df = read_dataframe(query,
                              params={'code': ts_code, 'from_d': str(fetch_from), 'to_d': str(end_date)})
         except Exception as e:
+            record_error(e, handled=True)
             return f'读取历史行情失败：{str(e)}'
 
         if df.empty:
@@ -632,8 +680,7 @@ class BollDetectionTool(BaseTool):
 
         # 4. 绘制布林带走势 + 超买超卖标记（仅画检测区间）
         os.makedirs(IMAGE_DIR, exist_ok=True)
-        safe_code = ts_code.replace('.', '_')
-        save_path = os.path.join(IMAGE_DIR, f'boll_{safe_code}_{int(time.time() * 1000)}.png')
+        save_path = image_path('boll')
         chart_ok = _plot_boll(det, hits, save_path,
                               f'{stock_name}({ts_code}) BOLL(20,2) 超买超卖检测')
 
@@ -685,6 +732,7 @@ def _plot_boll(det, hits, save_path, title):
         plt.close()
         return True
     except Exception as e:
+        record_error(e, handled=True)
         print(f'BOLL 检测图生成失败（仅返回表格）: {e}')
         return False
 
@@ -713,6 +761,7 @@ class ProphetAnalysisTool(BaseTool):
         'required': False,
     }]
 
+    @record_tool_exceptions
     def call(self, params: str, **kwargs) -> str:
         args = json.loads(params) if isinstance(params, str) else params
         ts_code = str(args.get('ts_code', '')).strip()
@@ -740,12 +789,10 @@ class ProphetAnalysisTool(BaseTool):
             ORDER BY trade_date ASC
         """)
         try:
-            engine = create_engine(db_url(),
-                                   connect_args={'connect_timeout': 10},
-                                   pool_size=5, max_overflow=10)
-            df = pd.read_sql(query, engine,
+            df = read_dataframe(query,
                              params={'code': ts_code, 'from_d': str(start_date), 'to_d': str(end_date)})
         except Exception as e:
+            record_error(e, handled=True)
             return f'读取历史行情失败：{str(e)}'
 
         if df.empty:
@@ -780,6 +827,7 @@ class ProphetAnalysisTool(BaseTool):
                 model.fit(pf)
             fc = model.predict(pf)  # 在历史区间上分解
         except Exception as e:
+            record_error(e, handled=True)
             return f'Prophet 建模或分解失败：{str(e)}'
 
         # 3. 汇总分量统计表
@@ -803,8 +851,7 @@ class ProphetAnalysisTool(BaseTool):
 
         # 4. 可视化：trend、weekly、yearly 三个分量子图
         os.makedirs(IMAGE_DIR, exist_ok=True)
-        safe_code = ts_code.replace('.', '_')
-        save_path = os.path.join(IMAGE_DIR, f'prophet_{safe_code}_{int(time.time() * 1000)}.png')
+        save_path = image_path('prophet')
         chart_ok = _plot_prophet_components(
             fc, save_path,
             f'{stock_name}({ts_code}) Prophet 周期性分解 '
@@ -862,6 +909,7 @@ def _plot_prophet_components(fc, save_path, title):
         plt.close()
         return True
     except Exception as e:
+        record_error(e, handled=True)
         print(f'Prophet 分量图生成失败（仅返回表格）: {e}')
         return False
 
@@ -874,8 +922,11 @@ def generate_chart_png(df: pd.DataFrame, save_path: str, sql: str = '') -> bool:
     - 若 X 轴是日期/时间且点数 > 8，画折线图（适合行情走势）。
     - 否则画柱状图（适合分类对比）。
     """
+    fig = None
     try:
         plot_df = df.copy()
+        if len(plot_df) > 500:
+            plot_df = plot_df.iloc[np.linspace(0, len(plot_df) - 1, 500, dtype=int)].copy()
         if plot_df.shape[1] < 2:
             return False  # 只有 1 列无法画图
 
@@ -896,14 +947,15 @@ def generate_chart_png(df: pd.DataFrame, save_path: str, sql: str = '') -> bool:
 
         x_labels = plot_df[x_col].astype(str).tolist()
         n = len(plot_df)
-        is_date_like = x_col.lower() in ('trade_date', 'date', '交易日期')
-        if not is_date_like:
+        is_date_like = x_col.lower() in ('trade_date', 'date', '交易日期', '月份')
+        if (not is_date_like and not pd.api.types.is_numeric_dtype(plot_df[x_col])
+                and plot_df[x_col].astype(str).str.match(r'^\d{4}[-/]\d{1,2}([-/]\d{1,2})?').all()):
             try:
                 is_date_like = pd.to_datetime(plot_df[x_col], errors='raise').dtype == 'datetime64[ns]'
             except Exception:
                 is_date_like = False
 
-        fig, ax = plt.subplots(figsize=(max(8, n * 0.5), 6))
+        fig, ax = plt.subplots(figsize=(10, 6))
         if is_date_like and n > 8:
             # 折线图：行情走势
             for c in y_cols:
@@ -929,8 +981,12 @@ def generate_chart_png(df: pd.DataFrame, save_path: str, sql: str = '') -> bool:
         plt.close()
         return True
     except Exception as e:
+        record_error(e, handled=True)
         print(f'图表生成失败（仅返回表格）: {e}')
         return False
+    finally:
+        if fig is not None:
+            plt.close(fig)
 
 
 def _set_xticks(ax, labels, n):
@@ -950,22 +1006,25 @@ def init_agent_service():
         'model': LLM_MODEL,
         'model_server': LLM_BASE_URL,
         'api_key': dashscope.api_key,
-        'timeout': 60,
-        'retry_count': 3,
         'generate_cfg': {
             'max_input_tokens': 30000,
+            'max_retries': 0,
         },
     }
-    # 知识库：faq.txt 提供分析思路 Tips 与 SQL 示例，经 RAG 检索后作为上下文补充
-    # 用脚本所在目录拼绝对路径，避免从其他工作目录启动时找不到 './faq.txt'
+    # FAQ 仅约 2k tokens，直接注入，避免每次提问先用模型拆题和提取关键词。
     faq_path = os.path.join(BASE_DIR, 'faq.txt')
-    bot = Assistant(
-        llm=llm_cfg,
+    with open(faq_path, encoding='utf-8') as source:
+        local_knowledge = source.read()
+    bot = TracedAssistant(
+        llm=NativeToolModel(llm_cfg),
         name='股票数据助手',
         description='基于 stock_daily 表的股票问数分析 + Tavily 联网资讯搜索',
-        system_message=system_prompt,
-        function_list=['exc_sql', 'tavily_search', 'arima_stock', 'boll_detection', 'prophet_analysis'],
-        files=[faq_path],
+        system_message=system_prompt + '\n\n本地分析参考：\n' + local_knowledge +
+            '\n\n工具调用使用 API 原生 tool_calls 字段，不要输出工具协议标记、模拟工具返回或编造文件路径。'
+            '股票数值和预测必须先调用工具。工具执行后由应用直接显示真实表格、图片及失败提示；'
+            '最终回复只需简短说明执行状态，不要复制表格、图片或再次调用已完成的相同工具。',
+        function_list=['exc_sql', 'stock_analysis', 'tavily_search', 'arima_stock', 'boll_detection', 'prophet_analysis'],
+        files=[],
     )
     print('助手初始化成功！')
     return bot
@@ -992,23 +1051,28 @@ def app_tui():
             print('\n已退出。')
             break
         except Exception as e:
+            record_error(e, handled=True)
             print(f'处理请求时出错: {e}')
 
 
 def cleanup_images():
-    """关闭界面（进程退出）时删除本次会话生成的所有图表文件。"""
+    """Remove only this process's images; never scan other instance directories."""
     prefixes = ('chart_', 'arima_', 'boll_', 'prophet_')
     try:
         if not os.path.isdir(IMAGE_DIR):
             return
         removed = 0
-        for f in os.listdir(IMAGE_DIR):
-            if f.startswith(prefixes) and f.endswith('.png'):
-                try:
-                    os.remove(os.path.join(IMAGE_DIR, f))
-                    removed += 1
-                except OSError:
-                    pass
+        root = os.path.realpath(IMAGE_DIR)
+        for directory, _, files in os.walk(root, followlinks=False):
+            for f in files:
+                candidate = os.path.realpath(os.path.join(directory, f))
+                if (os.path.commonpath([root, candidate]) == root
+                        and f.startswith(prefixes) and f.endswith('.png')):
+                    try:
+                        os.remove(candidate)
+                        removed += 1
+                    except OSError:
+                        pass
         if removed:
             print(f'\n已清理临时图表文件 {removed} 张。')
     except OSError:
@@ -1024,12 +1088,8 @@ def app_gui():
     chatbot_config = {
         'prompt.suggestions': [
             '对比贵州茅台和五粮液 2025 年每个月末的收盘价走势',
-            '统计 2025 年 1 月四只股票的平均涨跌幅，并按涨跌幅排序',
-            '查询中芯国际成交量最大的前 10 个交易日',
-            '搜索最近关于中芯国际的重要新闻和公司公告',
-            '用 ARIMA 预测贵州茅台(600519.SH) 未来 10 个交易日的收盘价',
-            '用布林带检测中芯国际(688981.SH) 过去一年的超买超卖日期',
-            '用 Prophet 分析贵州茅台(600519.SH) 的周期性规律',
+            '统计 2025 年 1 月四只股票的平均日涨跌幅，并从高到低排名',
+            '查询中芯国际 2025 年成交量最大的前 10 个交易日',
         ]
     }
     os.makedirs(IMAGE_DIR, exist_ok=True)

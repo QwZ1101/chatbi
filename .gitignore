@@ -22,3 +22,6 @@ chatbi_images/
 image_show/
 workspace/
 
+# Local execution traces can contain business data
+/logs/
+/trace_exports/

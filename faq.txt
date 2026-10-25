@@ -2,59 +2,23 @@
 
 数据来源：MySQL 表 stock_daily（股票历史日线行情）。
 覆盖股票：贵州茅台(600519.SH)、五粮液(000858.SZ)、国泰君安(601211.SH)、中芯国际(688981.SH)。
-数据区间：2025-01-01 至今。仅允许 SELECT 查询。
+实际数据范围以查询结果为准，不保证更新到今天。仅允许只读查询。
 
 
 Q1：对比两只股票在某一年（或某一时间段）的涨跌幅，应该怎么算？
 
-A1：
-思路：先分别找到两只股票在该区间第一个交易日和最后一个交易日的收盘价，
-再按「区间涨跌幅 =（最后一天收盘价 - 第一天收盘价）/ 第一天收盘价 * 100%」计算，
-最后比较两者的区间涨跌幅。
-注意：非交易日（周末、节假日）没有数据，区间首末日要用实际有行情记录的
-MIN(trade_date) / MAX(trade_date)，不能直接拿日历上的 1 月 1 日或 12 月 31 日的价格。
-示例 SQL（2025 年贵州茅台 vs 五粮液，MySQL 8 窗口函数）：
-WITH t AS (
-    SELECT ts_code, stock_name, trade_date, close,
-           ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY trade_date ASC)  AS rn_first,
-           ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY trade_date DESC) AS rn_last
-    FROM stock_daily
-    WHERE stock_name IN ('贵州茅台', '五粮液')
-      AND trade_date BETWEEN '2025-01-01' AND '2025-12-31'
-)
-SELECT stock_name,
-       MAX(CASE WHEN rn_first = 1 THEN close END) AS first_close,
-       MAX(CASE WHEN rn_last  = 1 THEN close END) AS last_close,
-       ROUND((MAX(CASE WHEN rn_last = 1 THEN close END)
-            - MAX(CASE WHEN rn_first = 1 THEN close END))
-            / MAX(CASE WHEN rn_first = 1 THEN close END) * 100, 2) AS interval_pct
-FROM t
-GROUP BY ts_code, stock_name
-ORDER BY interval_pct DESC;
+A1：调用 stock_analysis 固定分析工具，mode=interval_return。
+示例参数：{"mode":"interval_return","ts_codes":["600519.SH","000858.SZ"],"start_date":"2025-01-01","end_date":"2025-12-31"}
+工具按每只股票区间内实际首末交易记录计算 (末日收盘价/首日收盘价-1)×100%。
+同时展示首末取值日期和观测天数；不能把单日涨跌幅相加。只有一条行情时无法计算区间涨跌幅。
+使用库内收盘价，不额外做复权或总回报调整。不要生成 CTE、窗口函数或子查询。
 
+Q2：对比多只股票每个月末的收盘价走势，怎么查询？
 
-Q2：对比多只股票每个月末的收盘价走势，SQL 怎么写？
-
-A2：
-思路：每月最后一天可能不是交易日，先用 ROW_NUMBER() 按股票、月份分区并按日期倒序编号，
-取 rn = 1 的当月最后一个交易日；再用 CASE WHEN 把股票透视成宽表（每只股票一列），
-这样查询结果第一列是月份、其余列是各股票收盘价，便于自动画折线图对比。
-示例 SQL：
-SELECT `month`,
-       MAX(CASE WHEN stock_name = '贵州茅台' THEN close END) AS `贵州茅台`,
-       MAX(CASE WHEN stock_name = '五粮液'   THEN close END) AS `五粮液`
-FROM (
-    SELECT stock_name, close,
-           DATE_FORMAT(trade_date, '%Y-%m') AS `month`,
-           ROW_NUMBER() OVER (PARTITION BY ts_code, DATE_FORMAT(trade_date, '%Y-%m')
-                              ORDER BY trade_date DESC) AS rn
-    FROM stock_daily
-    WHERE stock_name IN ('贵州茅台', '五粮液')
-      AND trade_date BETWEEN '2025-01-01' AND '2025-12-31'
-) t
-WHERE rn = 1
-GROUP BY `month`
-ORDER BY `month`;
+A2：调用 stock_analysis，mode=monthly_close。
+示例参数：{"mode":"monthly_close","ts_codes":["600519.SH","000858.SZ"],"start_date":"2025-01-01","end_date":"2025-12-31"}
+每只股票每月取指定区间内最后一条行情，展示实际日期及收盘价，并按股票分系列作图。
+MAX(close) 是最高价，不能代替月末价。未结束月份或缺少行情的月份，仅代表截至可用日期。
 
 
 Q3：统计某段时间内各只股票的平均日涨跌幅并排序，怎么写？
@@ -106,20 +70,12 @@ LIMIT 1;
 （查最低收盘价日期时改为 ORDER BY close ASC。）
 
 
-Q6：统计某段时间各股票的上涨天数、下跌天数和胜率，怎么写？
+Q6：统计某段时间各股票的上涨天数、下跌天数和上涨日占比，怎么查询？
 
-A6：
-思路：用 CASE WHEN 按 pct_chg 正负分别计数，上涨天数 / 总交易日即胜率。
-示例 SQL：
-SELECT stock_name,
-       SUM(CASE WHEN pct_chg > 0 THEN 1 ELSE 0 END) AS up_days,
-       SUM(CASE WHEN pct_chg < 0 THEN 1 ELSE 0 END) AS down_days,
-       COUNT(*) AS total_days,
-       ROUND(SUM(CASE WHEN pct_chg > 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 2) AS win_rate
-FROM stock_daily
-WHERE trade_date BETWEEN '2025-01-01' AND '2025-12-31'
-GROUP BY ts_code, stock_name
-ORDER BY win_rate DESC;
+A6：调用 stock_analysis，mode=daily_stats。
+示例参数：{"mode":"daily_stats","ts_codes":["600519.SH","000858.SZ"],"start_date":"2025-01-01","end_date":"2025-12-31"}
+分别统计 pct_chg 大于 0、小于 0、等于 0 的天数。上涨日占比的分母包含平盘日。
+空值或重复交易日期会停止计算，不静默改变分母；该比例不代表未来获利概率。
 
 
 Q7：指标口径与 SQL 编写易错点 Tips
@@ -127,16 +83,16 @@ Q7：指标口径与 SQL 编写易错点 Tips
 A7：
 1. pct_chg 是「单日」涨跌幅（百分比，基于前收盘价 pre_close）。计算区间累计涨跌幅时，
    不能把每日 pct_chg 直接相加，必须用区间首末收盘价（first/last close）计算，
-   或对每日收益率做连乘。
+   本工具采用区间首末收盘价口径。
 2. `change` 是 MySQL 保留字（涨跌额），SQL 中出现时必须加反引号：`change`。
 3. vol 成交量单位是「手」（1 手 = 100 股）；amount 成交额单位是「千元」，
    输出结论时注意单位换算，不要直接说成「元」或「股」。
 4. 非交易日无数据；按日/周/月聚合时，日期口径要落在实际交易日上，
-   月末取值参考 Q2 的 ROW_NUMBER() 写法。
+   月末取值使用 Q2 的 stock_analysis 工具。
 5. 股票名称必须写 stock_name 中登记的全称，如「贵州茅台」「中芯国际」，
    不要写成「茅台」「中芯」；也可用 ts_code 精确过滤（如 '600519.SH'）。
 6. 日期过滤一律用 trade_date，字符串格式 'YYYY-MM-DD'，
    如 WHERE trade_date BETWEEN '2025-01-01' AND '2025-03-31'。
 7. 为便于自动可视化，查询结果尽量让第一列为分类或日期，其余列为数值列；
-   多只股票对比时用 CASE WHEN 转成宽表（一只股票一列），避免长表导致系列混在一起。
+   多只股票月末对比使用 stock_analysis，它会按代码生成独立系列。
 8. 只允许对 stock_daily 表做 SELECT，禁止生成 INSERT/UPDATE/DELETE 等写操作语句。

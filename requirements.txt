@@ -1,9 +1,12 @@
 # ChatBI 股票助手依赖（Python 3.9）
 # 安装：pip install -r requirements.txt
 
-# Agent 框架与大模型（[rag] 扩展为知识库 faq.txt 的检索依赖）
-qwen-agent[rag]>=0.0.11
+# Agent 框架与大模型
+# [rag] 知识库 faq.txt 检索；[gui] Web 界面（gradio）；soundfile 是 qwen-agent 导入时硬依赖
+qwen-agent[rag,gui]>=0.0.11
+soundfile>=0.12
 dashscope>=1.20.0
+openai>=1.0,<2
 
 # 数据库
 sqlalchemy>=2.0
@@ -27,3 +30,7 @@ chinesecalendar>=1.8
 # 数据采集脚本 fetch_stock_history.py 专用
 tushare>=1.2
 openpyxl>=3.1
+
+# SQL 执行前解析与本机只读账号配置
+sqlglot==27.29.0
+python-dotenv>=1.0
