@@ -74,6 +74,12 @@ except Exception:  # pragma: no cover - GUI 依赖缺失时仍可用 TUI
     WebUI = None
 
 # 解决中文显示问题
+from matplotlib import font_manager
+# Register newly installed Linux fonts even if Matplotlib's font cache predates them.
+for font_path in ['/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+                  '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc']:
+    if os.path.isfile(font_path):
+        font_manager.fontManager.addfont(font_path)
 plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'WenQuanYi Zen Hei', 'SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 

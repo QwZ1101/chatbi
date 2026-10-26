@@ -19,6 +19,7 @@ class OfflineAssistant(TracedAssistant):
         self.args = args
         self.llm = types.SimpleNamespace(model='offline_test_no_model')
         self.name = 'offline-test'
+        self.system_message = ''
         self.function_map = {'exc_sql': app.ExcSQLTool()}
 
     def _run(self, messages, **kwargs):

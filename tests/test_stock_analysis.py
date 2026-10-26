@@ -94,6 +94,7 @@ class StockAnalysisTests(unittest.TestCase):
             def __init__(self):
                 self.llm = types.SimpleNamespace(model='offline_test')
                 self.name = 'offline-analysis'
+                self.system_message = ''
                 self.function_map = {'stock_analysis': app.StockAnalysisTool()}
 
             def _run(self, messages, **kwargs):
