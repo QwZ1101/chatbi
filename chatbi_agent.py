@@ -1125,7 +1125,8 @@ def app_gui():
     # 会话期间保留所有图以便翻阅历史；关闭界面（Ctrl+C / 正常退出）时统一清理
     atexit.register(cleanup_images)
     print('正在启动 Web 界面...')
-    WebUI(bot, chatbot_config=chatbot_config).run()
+    # 只绑回环地址，对外入口统一走 Nginx（basic-auth + HTTPS）
+    WebUI(bot, chatbot_config=chatbot_config).run(server_name='127.0.0.1')
 
 
 if __name__ == '__main__':
