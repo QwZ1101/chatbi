@@ -81,7 +81,7 @@ class NativeToolModel(BaseChatModel):
     def support_multimodal_output(self):
         return True
 
-    def _preprocess_messages(self, messages, lang, generate_cfg, functions=None):
+    def _preprocess_messages(self, messages, lang, generate_cfg, functions=None, use_raw_api=False):
         for msg in messages:
             if isinstance(msg.content, list) and any(item.text is None for item in msg.content):
                 raise ToolProtocolError('当前股票问数入口仅支持文字，请使用文字描述问题。')
