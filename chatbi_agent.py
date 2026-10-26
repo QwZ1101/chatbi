@@ -59,6 +59,7 @@ from sql_guard import validate_sql, POLICY_VERSION
 from request_cache import current_cache
 from stock_analysis import analyze_stocks
 from forecast_policy import forecast_origin
+from result_labels import display_labels, result_table, ordered_metric, metric_group
 import uuid
 
 import dashscope
@@ -73,7 +74,7 @@ except Exception:  # pragma: no cover - GUI 依赖缺失时仍可用 TUI
     WebUI = None
 
 # 解决中文显示问题
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS']
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'WenQuanYi Zen Hei', 'SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -91,13 +92,10 @@ def image_path(prefix='chart'):
 
 
 def file_url(path):
-    # Gradio 5 moved the static file route under /gradio_api; Gradio 4 serves it at root.
-    try:
-        import gradio
-        prefix = '/gradio_api/file=' if int(gradio.__version__.split('.')[0]) >= 5 else '/file='
-    except Exception:
-        prefix = '/file='
-    return prefix + os.path.abspath(path).replace('\\', '/')
+    # The Qwen/ModelScope chatbot rewrites this marker to its configured API root.
+    # Including /gradio_api here duplicates that prefix in Gradio 5's renderer.
+    from urllib.parse import quote
+    return '/file=' + quote(os.path.abspath(path).replace('\\', '/'), safe='/:')
 
 # 数据库连接统一由 db_access 管理，只接受专用只读账号。
 
@@ -229,7 +227,7 @@ class StockAnalysisTool(BaseTool):
             output = escape(result.note)
             if result.table.empty:
                 return output
-            output += '\n\n' + result.table.to_html(index=False, border=0, justify='center', na_rep='不可计算')
+            output += '\n\n' + result_table(result.table, na_rep='不可计算')
             os.makedirs(IMAGE_DIR, exist_ok=True)
             path = image_path()
             if generate_chart_png(result.chart, path):
@@ -276,9 +274,10 @@ class ExcSQLTool(BaseTool):
             # 避免 Gradio 把未识别的表格当普通段落导致换行被折叠成一行
             table_html = (f'查询返回 {len(df)} 行，表格显示前 {min(20, len(df))} 行。'
                           + (' 已达到查询行数上限，结果可能截断，请缩小范围。' if len(df) >= 5000 else '')
-                          + '\n' + df.head(20).to_html(index=False, border=0, justify='center'))
+                          + '\n' + result_table(df.head(20), sql_input))
             if len(df) > 500:
                 table_html += '\n图表最多等距选取 500 条记录展示，不改变表格数据或查询计算结果。'
+            table_html += '\n图表优先展示数值排序字段；其他情况只对比同单位指标，完整结果见表格。'
 
             # 生成图表并保存到本地，通过 Gradio 静态文件路由暴露
             # （会话期间保留所有图以便翻阅历史，关闭界面时由 cleanup_images 统一清理）
@@ -474,7 +473,7 @@ class ArimaStockTool(BaseTool):
             '预测收盘价(元)': np.round(forecast, 2),
             '相对最新收盘涨跌幅(%)': np.round((forecast - last_close) / last_close * 100, 2),
         })
-        table_html = pred_df.to_html(index=False, border=0, justify='center')
+        table_html = result_table(pred_df)
 
         # 4. 绘制历史走势 + 预测（预测段与历史最后一个点相连，注意 x/y 长度对齐）
         os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -684,7 +683,7 @@ class BollDetectionTool(BaseTool):
                 '类型': hits['type'],
                 '偏离轨线(%)': hits['偏离上轨/下轨(%)'],
             })
-            table_html = out.to_html(index=False, border=0, justify='center')
+            table_html = result_table(out)
 
         # 4. 绘制布林带走势 + 超买超卖标记（仅画检测区间）
         os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -854,7 +853,7 @@ class ProphetAnalysisTool(BaseTool):
                 '见可视化图（按年内日期展开）',
             ],
         })
-        table_html = stats.to_html(index=False, border=0, justify='center', escape=False)
+        table_html = result_table(stats)
 
         # 4. 可视化：trend、weekly、yearly 三个分量子图
         os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -937,15 +936,27 @@ def generate_chart_png(df: pd.DataFrame, save_path: str, sql: str = '') -> bool:
             return False  # 只有 1 列无法画图
 
         x_col = plot_df.columns[0]
+        labels = dict(zip(plot_df.columns, display_labels(plot_df.columns, sql)))
         # 仅保留可转为数值的列作为 Y
         y_cols = []
         for c in plot_df.columns[1:]:
+            if labels[c] in ('股票代码', '记录编号'):
+                continue
             coerced = pd.to_numeric(plot_df[c], errors='coerce')
             if coerced.notna().any():
                 plot_df[c] = coerced
                 y_cols.append(c)
         if not y_cols:
             return False
+
+        rank_metric = ordered_metric(y_cols, sql) if sql else None
+        if rank_metric:
+            # A volume leaderboard is not a chronological price chart.
+            y_cols = [rank_metric]
+        elif sql:
+            # Keep only comparable units; never put money, volume and % on one scale.
+            group = metric_group(labels[y_cols[0]])
+            y_cols = [c for c in y_cols if metric_group(labels[c]) == group][:6]
 
         plot_df = plot_df.dropna(subset=y_cols, how='all')
         if plot_df.empty:
@@ -962,10 +973,11 @@ def generate_chart_png(df: pd.DataFrame, save_path: str, sql: str = '') -> bool:
                 is_date_like = False
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        if is_date_like and n > 8:
+        chronological = is_date_like and plot_df[x_col].is_monotonic_increasing
+        if chronological and n > 8 and not rank_metric:
             # 折线图：行情走势
             for c in y_cols:
-                ax.plot(range(n), plot_df[c].values, marker='o', linewidth=1.5, label=c)
+                ax.plot(range(n), plot_df[c].values, marker='o', linewidth=1.5, label=labels[c])
             _set_xticks(ax, x_labels, n)
             ax.set_ylabel('数值')
         else:
@@ -974,13 +986,15 @@ def generate_chart_png(df: pd.DataFrame, save_path: str, sql: str = '') -> bool:
             width = 0.8 / max(1, len(bar_cols))
             for i, c in enumerate(bar_cols):
                 offsets = (np.arange(n) + i * width - (len(bar_cols) - 1) * width / 2)
-                ax.bar(offsets, plot_df[c].values, width=width, label=c)
+                ax.bar(offsets, plot_df[c].values, width=width, label=labels[c])
             ax.set_xticks(np.arange(n))
             ax.set_xticklabels(x_labels, rotation=45, ha='right')
             ax.set_ylabel('数值')
 
+        ax.set_xlabel(labels[x_col])
+        ax.set_ylabel(labels[y_cols[0]] if len(y_cols) == 1 else '收盘价（元）' if x_col == '月份' else metric_group(labels[y_cols[0]]))
         ax.legend(loc='best')
-        ax.set_title(x_col)
+        ax.set_title(labels[rank_metric] + '排名' if rank_metric else labels[x_col] + '对比')
         plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
         plt.tight_layout()
         plt.savefig(save_path, dpi=100)

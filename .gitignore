@@ -25,3 +25,4 @@ workspace/
 # Local execution traces can contain business data
 /logs/
 /trace_exports/
+*.log
