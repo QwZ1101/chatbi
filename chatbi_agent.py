@@ -77,7 +77,7 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial
 plt.rcParams['axes.unicode_minus'] = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 图片存到纯 ASCII 的系统临时目录，避免工程路径含中文/全角冒号导致 /file= URL 加载失败
+# 图片存到纯 ASCII 的系统临时目录，避免工程路径含中文/全角冒号导致图片 URL 加载失败
 IMAGE_BASE = os.path.join(tempfile.gettempdir(), 'chatbi_images')
 IMAGE_DIR = os.path.join(IMAGE_BASE, 'instance_' + uuid.uuid4().hex)
 
@@ -88,6 +88,16 @@ def image_path(prefix='chart'):
     folder = os.path.join(IMAGE_DIR, cache.id if cache else 'direct')
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, prefix + '_' + uuid.uuid4().hex + '.png')
+
+
+def file_url(path):
+    # Gradio 5 moved the static file route under /gradio_api; Gradio 4 serves it at root.
+    try:
+        import gradio
+        prefix = '/gradio_api/file=' if int(gradio.__version__.split('.')[0]) >= 5 else '/file='
+    except Exception:
+        prefix = '/file='
+    return prefix + os.path.abspath(path).replace('\\', '/')
 
 # 数据库连接统一由 db_access 管理，只接受专用只读账号。
 
@@ -223,7 +233,7 @@ class StockAnalysisTool(BaseTool):
             os.makedirs(IMAGE_DIR, exist_ok=True)
             path = image_path()
             if generate_chart_png(result.chart, path):
-                output += '\n\n![区间分析图](/file=' + os.path.abspath(path).replace('\\', '/') + ')'
+                output += '\n\n![区间分析图](' + file_url(path) + ')'
             return output
         except Exception as error:
             record_error(error, handled=True)
@@ -270,7 +280,7 @@ class ExcSQLTool(BaseTool):
             if len(df) > 500:
                 table_html += '\n图表最多等距选取 500 条记录展示，不改变表格数据或查询计算结果。'
 
-            # 生成图表并保存到本地，通过 Gradio /file= 暴露
+            # 生成图表并保存到本地，通过 Gradio 静态文件路由暴露
             # （会话期间保留所有图以便翻阅历史，关闭界面时由 cleanup_images 统一清理）
             os.makedirs(IMAGE_DIR, exist_ok=True)
             save_path = image_path()
@@ -278,8 +288,7 @@ class ExcSQLTool(BaseTool):
 
             result = table_html
             if chart_ok:
-                img_local_path = os.path.abspath(save_path).replace('\\', '/')
-                result = f"{table_html}\n\n![查询结果图](/file={img_local_path})"
+                result = f"{table_html}\n\n![查询结果图]({file_url(save_path)})"
             if cache is not None:
                 cache.put(sql_key, result)
             return result
@@ -480,8 +489,7 @@ class ArimaStockTool(BaseTool):
                 f'库内末条收盘价：{last_close:.2f} 元；从末条观测后预测 {n} 步。')
         result = f'{head}\n\n{table_html}'
         if chart_ok:
-            img_local_path = os.path.abspath(save_path).replace('\\', '/')
-            result += f"\n\n![{stock_name}ARIMA预测图](/file={img_local_path})"
+            result += f"\n\n![{stock_name}ARIMA预测图]({file_url(save_path)})"
         result += ('\n\n注：日期由本地工作日/节假日规则估算，未核对交易所完整交易日历。')
         if stale_note:
             result += f'\n{stale_note}'
@@ -690,8 +698,7 @@ class BollDetectionTool(BaseTool):
                 f'超买 <b>{n_ob}</b> 天，超卖 <b>{n_os}</b> 天。')
         result = f'{head}\n\n{table_html}'
         if chart_ok:
-            img_local_path = os.path.abspath(save_path).replace('\\', '/')
-            result += f"\n\n![{stock_name}BOLL超买超卖图](/file={img_local_path})"
+            result += f"\n\n![{stock_name}BOLL超买超卖图]({file_url(save_path)})"
         result += ('\n\n注：布林带为 20 日均线 ± 2 倍标准差（总体标准差 ddof=0）；收盘价高于上轨记为超买、'
                    '低于下轨记为超卖，仅代表相对近期价格的统计偏离，不构成投资建议。')
         return result
@@ -862,8 +869,7 @@ class ProphetAnalysisTool(BaseTool):
                 f'共 {len(fc)} 个交易日；模型：线性趋势 + 周内效应 + 年内季节（加性模型）。')
         result = f'{head}\n\n{table_html}'
         if chart_ok:
-            img_local_path = os.path.abspath(save_path).replace('\\', '/')
-            result += f"\n\n![{stock_name}Prophet周期性分解图](/file={img_local_path})"
+            result += f"\n\n![{stock_name}Prophet周期性分解图]({file_url(save_path)})"
         result += ('\n\n注：trend 为长期价格趋势；weekly 反映周一~周五的系统性偏离（周内效应）；'
                    'yearly 反映一年内的季节性规律。分量是模型对历史数据的分解结果，不构成投资建议。')
         return result
@@ -1094,7 +1100,7 @@ def app_gui():
     }
     os.makedirs(IMAGE_DIR, exist_ok=True)
     # qwen-agent 的 WebUI.run 不会把 allowed_paths 传给 gradio.launch()，
-    # 改用 Gradio 4.x 支持的环境变量开放图片目录的 /file= 访问
+    # 改用环境变量开放图片目录的静态文件访问
     os.environ['GRADIO_ALLOWED_PATHS'] = IMAGE_DIR
     # 会话期间保留所有图以便翻阅历史；关闭界面（Ctrl+C / 正常退出）时统一清理
     atexit.register(cleanup_images)
